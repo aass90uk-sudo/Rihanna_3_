@@ -14,7 +14,6 @@ from telegram.ext import (
     filters,
 )
 
-
 # ============================================================
 # الإعدادات
 # ============================================================
@@ -43,7 +42,7 @@ POST_INTERVAL_SECONDS = 2 * 60 * 60
 # رابط القناة والتوقيع
 # ============================================================
 
-CHANNEL_LINK = "https://t.me/Athar_Dz_Islamic"
+CHANNEL_LINK = "https://t.me"
 
 CHANNEL_FOOTER = (
     f"{CHANNEL_LINK}\n"
@@ -164,31 +163,18 @@ async def ask_ai(prompt: str) -> str:
 
 
 # ============================================================
-# إنشاء منشور القناة
+# إنشاء منشور القناة ونشره (تم ربطها بنظام الجدولة الرسمي)
 # ============================================================
 
-async def generate_channel_post() -> str:
-
-    return await ask_ai(
-        "اكتب الآن المنشور المطلوب للنشر في القناة."
-    )
-
-
-# ============================================================
-# نشر القناة
-# ============================================================
-
-async def publish_to_channel(
-    application: Application,
-):
-
+async def publish_to_channel_job(context: ContextTypes.DEFAULT_TYPE):
+    """وظيفة النشر الدوري الآمنة المرتبطة بـ JobQueue"""
     try:
-
-        post = await generate_channel_post()
+        logger.info("⏳ جاري إنشاء منشور دعوي جديد للقناة...")
+        post = await ask_ai("اكتب الآن المنشور المطلوب للنشر في القناة.")
 
         if not post:
             logger.warning(
-                "⚠️ لم يتم إنشاء منشور."
+                "⚠️ لم يتم إنشاء منشور من Groq."
             )
             return
 
@@ -198,44 +184,24 @@ async def publish_to_channel(
             f"{CHANNEL_FOOTER}"
         )
 
-        await application.bot.send_message(
+        await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=final_post,
             disable_web_page_preview=True,
         )
 
         logger.info(
-            "✅ تم نشر المنشور في القناة."
+            "✅ تم نشر المنشور بنجاح في القناة."
         )
 
     except Exception:
-
         logger.exception(
-            "❌ فشل نشر المنشور."
+            "❌ فشل نشر المنشور الفعلي في القناة."
         )
 
 
 # ============================================================
-# النشر كل ساعتين
-# ============================================================
-
-async def scheduled_publisher(
-    application: Application,
-):
-
-    while True:
-
-        await asyncio.sleep(
-            POST_INTERVAL_SECONDS
-        )
-
-        await publish_to_channel(
-            application
-        )
-
-
-# ============================================================
-# الرد على المجموعة
+# الرد على المجموعة (معدلة لمنع تكرار get_me واستجابة الأخطاء)
 # ============================================================
 
 async def handle_group_message(
@@ -263,29 +229,17 @@ async def handle_group_message(
     if not text:
         return
 
-    bot = await context.bot.get_me()
+    # تم إصلاحها هنا: استخدام بيانات كاش البوت المخزنة في النظام بدلاً من استدعاء الشبكة المكرر في كل رسالة
+    bot_username = context.bot.username
+    bot_id = context.bot.id
 
     mentioned = False
-
-    if bot.username:
-
-        mentioned = (
-            f"@{bot.username.lower()}"
-            in text.lower()
-        )
+    if bot_username:
+        mentioned = f"@{bot_username.lower()}" in text.lower()
 
     replied_to_bot = False
-
-    if message.reply_to_message:
-
-        if message.reply_to_message.from_user:
-
-            replied_to_bot = (
-                message.reply_to_message
-                .from_user
-                .id
-                == bot.id
-            )
+    if message.reply_to_message and message.reply_to_message.from_user:
+        replied_to_bot = message.reply_to_message.from_user.id == bot_id
 
     if not (
         mentioned
@@ -295,15 +249,20 @@ async def handle_group_message(
     ):
         return
 
-    if bot.username:
-
+    if bot_username:
         text = text.replace(
-            f"@{bot.username}",
+            f"@{bot_username}",
             ""
         ).strip()
 
     if not text:
         return
+
+    # إرسال حركة تفاعلية (جاري الكتابة) في المجموعة ليظهر أن البوت يقوم بالمعالجة
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    except Exception:
+        pass
 
     answer = await ask_ai(text)
 
@@ -311,16 +270,13 @@ async def handle_group_message(
         return
 
     try:
-
         await message.reply_text(
             answer,
             disable_web_page_preview=True,
         )
-
     except Exception:
-
         logger.exception(
-            "❌ فشل إرسال الرد."
+            "❌ فشل إرسال الرد للمجموعة."
         )
 
 
@@ -341,33 +297,32 @@ async def start_command(
 
 
 # ============================================================
-# تشغيل جدولة النشر
-# ============================================================
-
-async def post_init(
-    application: Application,
-):
-
-    asyncio.create_task(
-        scheduled_publisher(
-            application
-        )
-    )
-
-
-# ============================================================
-# Main
+# Main (محدثة بالكامل لضمان تشغيل مستقر بدون أخطاء الـ Polling)
 # ============================================================
 
 def main():
 
+    # تهيئة التطبيق الأساسي
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
+    # تشغيل جدولة النشر الدوري بشكل آمن ومستقر عبر الـ JobQueue المدمجة
+    job_queue = application.job_queue
+    if job_queue:
+        # تبدأ أول عملية نشر تلقائياً بعد مرور ساعتين من تشغيل البوت وتتكرر كل ساعتين
+        job_queue.run_repeating(
+            publish_to_channel_job, 
+            interval=POST_INTERVAL_SECONDS, 
+            first=POST_INTERVAL_SECONDS
+        )
+        logger.info(f"📅 تم ضبط جدولة النشر الدوري بنجاح كل {POST_INTERVAL_SECONDS // 3600} ساعات.")
+    else:
+        logger.warning("⚠️ تحذير: الـ JobQueue غير متوفرة للتطبيق.")
+
+    # تسجيل معالجات الأوامر والرسائل
     application.add_handler(
         CommandHandler(
             "start",
@@ -385,13 +340,16 @@ def main():
     )
 
     logger.info(
-        "🟢 البوت يعمل..."
+        "🟢 البوت يعمل ومستقر الآن ومستعد لاستلام التحديثات..."
     )
 
+    # تشغيل الـ Polling مع إسقاط التحديثات المعلقة السابقة لتفادي أخطاء الـ 409 القديمة
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
 if __name__ == "__main__":
     main()
+            
